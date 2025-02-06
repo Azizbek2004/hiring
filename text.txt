@@ -1,0 +1,796 @@
+src/executor.ts:import ITask from './Task';
+
+export interface ITaskCollection {
+    [targetId: string]: ITask
+}
+
+export interface ICompletedTasksCollection {
+    [targetId: string]: ITask[]
+}
+
+export interface IExecutor {
+    executeTask(task: ITask): Promise<void>
+    start(): void
+    stop(): void
+}
+
+export default class Executor implements IExecutor {
+    constructor() {
+        this.executeData = {
+            running: {},
+            completed: {},
+            performanceData: []
+        };
+
+        this.performanceReport = {
+            min: 0,
+            max: 0,
+            avg: 0
+        };
+    }
+
+    public start() {
+        this.executeData.running = {};
+        this.executeData.completed = {};
+        this.executeData.performanceData.length = 0;
+        this.performanceReport.min = 0;
+        this.performanceReport.max = 0;
+        this.performanceReport.avg = 0;
+
+        const now = process.hrtime.bigint();
+        this.startedAt = now;
+        this.prevPerformanceRecordedAt = now;
+        this.recordPerformanceInterval = setInterval(() => this.recordPerformance(true), 10);
+    }
+
+    public stop() {
+        // istanbul ignore if
+        if (this.recordPerformanceInterval) {
+            clearInterval(this.recordPerformanceInterval);
+            this.recordPerformanceInterval = undefined;
+        }
+
+        const totalTime = Number(process.hrtime.bigint() - this.startedAt);
+
+        this.performanceReport.min =
+            this.executeData.performanceData
+                .filter(record => !record.excludeFromMin)
+                .reduce((min, record) => {
+                    if (record.running.length < min) {
+                        return record.running.length;
+                    }
+                    return min;
+                }, Number.MAX_SAFE_INTEGER);
+
+        this.performanceReport.max =
+            this.executeData.performanceData.reduce((max, record) => {
+                if (record.running.length > max) {
+                    return record.running.length;
+                }
+                return max;
+            }, 0);
+
+        this.performanceReport.avg =
+            this.executeData.performanceData.reduce((avg: number, record) => {
+                return avg + record.running.length * record.time / totalTime;
+            }, 0);
+    }
+
+    public async executeTask(task: ITask) {
+        const running = this.executeData.running;
+        const completed = this.executeData.completed;
+        const targetId = task.targetId;
+
+        if (running[targetId]) {
+            throw new Error(cannot execute task ${targetId}: +
+                ${task.action}: task with the same targetId=${targetId} is running);
+        }
+
+        this.recordPerformance(true);
+
+        running[targetId] = task;
+        if (task._onExecute) {
+            task._onExecute();
+        }
+
+        this.recordPerformance(true);
+
+        switch (task.action) {
+            case 'init': {
+                await sleep(10 * (1 + targetId / 10));
+                this.recordPerformance(false);
+                await sleep(30 * (1 + targetId / 10));
+                break;
+            }
+            case 'prepare': {
+                await sleep(30 * (1 + targetId / 10));
+                this.recordPerformance(false);
+                await sleep(70 * (1 + targetId / 10));
+                break;
+            }
+            case 'work': {
+                await sleep(50 * (1 + targetId / 10));
+                this.recordPerformance(false);
+                await sleep(150 * (1 + targetId / 10));
+                break;
+            }
+            case 'finalize': {
+                await sleep(30 * (1 + targetId / 10));
+                this.recordPerformance(false);
+                await sleep(70 * (1 + targetId / 10));
+                break;
+            }
+            default: {
+                await sleep(25);
+                this.recordPerformance(false);
+                await sleep(25);
+                break;
+            }
+        }
+
+        this.recordPerformance(true);
+
+        delete running[targetId];
+
+        if (task._onComplete) {
+            task._onComplete();
+        }
+
+        this.recordPerformance(true);
+
+        if (!completed[targetId]) {
+            completed[targetId] = [];
+        }
+        completed[targetId].push({ targetId: task.targetId, action: task.action });
+
+        this.recordPerformance(true);
+    }
+
+    private recordPerformance(excludeFromMin: boolean) {
+        const now = process.hrtime.bigint();
+        const time = Number(now - this.prevPerformanceRecordedAt);
+        this.prevPerformanceRecordedAt = now;
+        this.executeData.performanceData.push({
+            excludeFromMin,
+            running: Object.values(this.executeData.running),
+            time
+        });
+    }
+
+    protected performanceReport: {
+        min: number
+        max: number
+        avg: number
+    };
+
+    protected executeData: {
+        running: ITaskCollection
+        completed: ICompletedTasksCollection
+        performanceData: Array<{
+            excludeFromMin: boolean
+            running: ITask[]
+            time: number
+        }>
+    };
+
+    private startedAt = BigInt(0);
+    private prevPerformanceRecordedAt = BigInt(0);
+    private recordPerformanceInterval?: NodeJS.Timeout;
+}
+
+async function sleep(ms: number) {
+    ms = Math.max(0, ms);
+    // ms += (Math.random() - 0.5) * ms / 10;
+    return new Promise<void>(r => setTimeout(() => r(), ms));
+};
+run.ts: import ITask from "./Task";
+
+async function run(
+  executor: { executeTask: (task: ITask) => Promise<void> },
+  queue: AsyncIterable<ITask>,
+  maxThreads: number = 0
+): Promise<void> {
+  const executing = new Map<number, boolean>();
+  let taskQueue: Promise<void>[] = []; // Changed from const to let
+
+  async function processTask(task: ITask) {
+    const { targetId } = task;
+    while (executing.has(targetId)) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    executing.set(targetId, true);
+    try {
+      await executor.executeTask(task);
+    } catch (error) {
+      console.error(Error executing task ${JSON.stringify(task)}:, error);
+    } finally {
+      executing.delete(targetId);
+    }
+  }
+
+  for await (const task of queue) {
+    taskQueue.push(processTask(task));
+    if (maxThreads > 0 && taskQueue.length >= maxThreads) {
+      await Promise.race(taskQueue);
+      taskQueue = taskQueue.filter((p) => p !== undefined);
+    }
+  }
+
+  await Promise.all(taskQueue);
+}:
+
+task.ts:export type ActionType = 'init' | 'prepare' | 'work' | 'finalize' | 'cleanup';
+
+export default interface ITask {
+    targetId: number
+    action: ActionType
+    _onExecute?: () => void
+    _onComplete?: () => void
+};
+
+test/data.ts :
+import ITask from '../src/Task';
+import ITaskExt from './ITaskExt';
+
+export const distinctTargetIdsCount = 12;
+
+export const queue: ITask[] = [
+    { targetId: 4, action: 'init' }, { targetId: 0, action: 'init' }, { targetId: 1, action: 'init' },
+    { targetId: 6, action: 'init' }, { targetId: 1, action: 'prepare' }, { targetId: 8, action: 'init' },
+    { targetId: 6, action: 'prepare' }, { targetId: 2, action: 'init' }, { targetId: 0, action: 'prepare' },
+    { targetId: 5, action: 'init' }, { targetId: 3, action: 'init' }, { targetId: 7, action: 'init' },
+    { targetId: 7, action: 'prepare' }, { targetId: 3, action: 'prepare' }, { targetId: 0, action: 'work' },
+    { targetId: 8, action: 'prepare' }, { targetId: 3, action: 'work' }, { targetId: 4, action: 'prepare' },
+    { targetId: 9, action: 'init' }, { targetId: 2, action: 'prepare' },
+    { targetId: 5, action: 'prepare' }, { targetId: 0, action: 'finalize' }, { targetId: 2, action: 'work' },
+    { targetId: 8, action: 'work' }, { targetId: 8, action: 'finalize' }, { targetId: 4, action: 'work' },
+    { targetId: 8, action: 'cleanup' }, { targetId: 9, action: 'prepare' }, { targetId: 0, action: 'cleanup' },
+    { targetId: 5, action: 'work' }, { targetId: 1, action: 'work' }, { targetId: 5, action: 'finalize' },
+    { targetId: 1, action: 'finalize' }, { targetId: 3, action: 'finalize' }, { targetId: 7, action: 'work' },
+    { targetId: 2, action: 'finalize' }, { targetId: 6, action: 'work' }, { targetId: 2, action: 'cleanup' },
+    { targetId: 3, action: 'cleanup' }, { targetId: 6, action: 'finalize' }, { targetId: 4, action: 'finalize' },
+    { targetId: 7, action: 'finalize' }, { targetId: 4, action: 'cleanup' }, { targetId: 5, action: 'cleanup' },
+    { targetId: 6, action: 'cleanup' }, { targetId: 7, action: 'cleanup' }, { targetId: 9, action: 'work' },
+    { targetId: 9, action: 'finalize' }, { targetId: 9, action: 'cleanup' }, { targetId: 1, action: 'cleanup' },
+    { targetId: 10, action: 'init' }, { targetId: 10, action: 'prepare' }, { targetId: 10, action: 'work' },
+    { targetId: 10, action: 'finalize' }, { targetId: 10, action: 'cleanup' }, { targetId: 11, action: 'init' },
+    { targetId: 11, action: 'prepare' }, { targetId: 11, action: 'work' }, { targetId: 11, action: 'finalize' },
+    { targetId: 11, action: 'cleanup' }
+];
+
+export const wantedResult = {
+    0: [{ targetId: 0, action: 'init' }, { targetId: 0, action: 'prepare' }, { targetId: 0, action: 'work' },
+    { targetId: 0, action: 'finalize' }, { targetId: 0, action: 'cleanup' }],
+    1: [{ targetId: 1, action: 'init' }, { targetId: 1, action: 'prepare' }, { targetId: 1, action: 'work' },
+    { targetId: 1, action: 'finalize' }, { targetId: 1, action: 'cleanup' }],
+    2: [{ targetId: 2, action: 'init' }, { targetId: 2, action: 'prepare' }, { targetId: 2, action: 'work' },
+    { targetId: 2, action: 'finalize' }, { targetId: 2, action: 'cleanup' }],
+    3: [{ targetId: 3, action: 'init' }, { targetId: 3, action: 'prepare' }, { targetId: 3, action: 'work' },
+    { targetId: 3, action: 'finalize' }, { targetId: 3, action: 'cleanup' }],
+    4: [{ targetId: 4, action: 'init' }, { targetId: 4, action: 'prepare' }, { targetId: 4, action: 'work' },
+    { targetId: 4, action: 'finalize' }, { targetId: 4, action: 'cleanup' }],
+    5: [{ targetId: 5, action: 'init' }, { targetId: 5, action: 'prepare' }, { targetId: 5, action: 'work' },
+    { targetId: 5, action: 'finalize' }, { targetId: 5, action: 'cleanup' }],
+    6: [{ targetId: 6, action: 'init' }, { targetId: 6, action: 'prepare' }, { targetId: 6, action: 'work' },
+    { targetId: 6, action: 'finalize' }, { targetId: 6, action: 'cleanup' }],
+    7: [{ targetId: 7, action: 'init' }, { targetId: 7, action: 'prepare' }, { targetId: 7, action: 'work' },
+    { targetId: 7, action: 'finalize' }, { targetId: 7, action: 'cleanup' }],
+    8: [{ targetId: 8, action: 'init' }, { targetId: 8, action: 'prepare' }, { targetId: 8, action: 'work' },
+    { targetId: 8, action: 'finalize' }, { targetId: 8, action: 'cleanup' }],
+    9: [{ targetId: 9, action: 'init' }, { targetId: 9, action: 'prepare' }, { targetId: 9, action: 'work' },
+    { targetId: 9, action: 'finalize' }, { targetId: 9, action: 'cleanup' }],
+    10: [{ targetId: 10, action: 'init' }, { targetId: 10, action: 'prepare' }, { targetId: 10, action: 'work' },
+    { targetId: 10, action: 'finalize' }, { targetId: 10, action: 'cleanup' }],
+    11: [{ targetId: 11, action: 'init' }, { targetId: 11, action: 'prepare' }, { targetId: 11, action: 'work' },
+    { targetId: 11, action: 'finalize' }, { targetId: 11, action: 'cleanup' }],
+};
+
+export function getQueue(maxThreads = 0) {
+    const q = queue.map(t => {
+        const item: ITaskExt = { ...t };
+        item._onExecute = () => item.running = true;
+        item._onComplete = () => {
+            delete item.running;
+            item.completed = true;
+        };
+        return item;
+    });
+
+    return {
+        [Symbol.asyncIterator]() {
+            let i = 0;
+            return {
+                async next() {
+                    while (q[i] && (q[i].completed || q[i].acquired)) {
+                        i++;
+                    }
+                    if (i < q.length) {
+                        if (i && i % maxThreads === 0) {
+                            await new Promise(r => setTimeout(r, 100));
+                        }
+                        const value = q[i++];
+                        if (value) {
+                            value.acquired = true;
+                        }
+                        return {
+                            done: false,
+                            value
+                        };
+                    } else {
+                        return {
+                            done: true,
+                            value: undefined as unknown as ITaskExt
+                        };
+                    }
+                }
+            };
+        },
+        q
+    };
+}:
+test/executor.spec.ts:
+import t from 'tap';
+import ITask from '../src/Task';
+import ExecutorExt from './ExecutorExt';
+
+t.test('Executor.executeTask()', async t => {
+    const executor = new ExecutorExt();
+    executor.start();
+
+    const init0Task: ITask = { targetId: 0, action: 'init' };
+    const init0Promise = executor.executeTask(init0Task);
+    t.equal(executor.getExecuteData().running[0], init0Task,
+        'executor.executeTask(init0Task) places task into executor.executeData.running');
+    
+    await init0Promise;
+    t.same(executor.getExecuteData().running, { },
+        'after execution of all tasks executor.executeData.running is empty');
+    t.same(executor.getExecuteData().completed, { [init0Task.targetId]: [init0Task] },
+        'executed init0Task is placed into executor.executeData.completed');
+    
+    const init2Task: ITask = { targetId: 2, action: 'init' };
+    const init3Task: ITask = { targetId: 3, action: 'init' };
+    const init2Promise = executor.executeTask(init2Task);
+    try {
+        await executor.executeTask(init3Task);
+        t.pass('simultaneous execution of two tasks with different targetId should not throw');
+    } catch(e) {
+        t.fail('simultaneous execution of two tasks with different targetId should not throw');
+    } finally {
+        await init2Promise;
+    }
+    
+    const init1Task: ITask = { targetId: 1, action: 'init' };
+    const prepare1Task: ITask = { targetId: 1, action: 'prepare' };
+    const init1Promise = executor.executeTask(init1Task);
+    try {
+        await executor.executeTask(prepare1Task);
+        t.fail('simultaneous execution of two tasks with the same targetId should throw');
+    } catch(e) {
+        t.pass('simultaneous execution of two tasks with the same targetId should throw');
+    } finally {
+        await init1Promise;
+    }
+
+    executor.stop();
+});
+
+t.test('Executor.performanceReport for 4 simultaneous tasks', async t => {
+    const executor = new ExecutorExt();
+    executor.start();
+
+    const init0Task: ITask = { targetId: 0, action: 'init' };
+    const init1Task: ITask = { targetId: 1, action: 'init' };
+    const init2Task: ITask = { targetId: 2, action: 'init' };
+    const init3Task: ITask = { targetId: 3, action: 'init' };
+
+    await Promise.all([
+        executor.executeTask(init0Task),
+        executor.executeTask(init1Task),
+        executor.executeTask(init2Task),
+        executor.executeTask(init3Task)
+    ]);
+    
+    executor.stop();
+
+    t.ok(executor.getPerformanceReport().min >= 3 && executor.getPerformanceReport().min <= 4,
+        'executor.performanceReport.min is between 3 and 4 (' + executor.getPerformanceReport().min + ')');
+    t.equal(executor.getPerformanceReport().max, 4,
+        'executor.performanceReport.max 4 (' + executor.getPerformanceReport().max + ')');
+    t.ok(executor.getPerformanceReport().avg >= 3 && executor.getPerformanceReport().avg <= 4,
+        'executor.performanceReport.avg is between 3 and 4 (' + executor.getPerformanceReport().avg + ')');
+});
+
+t.test('Executor.performanceReport for 3 simultaneous tasks + 2 simulataneous tasks after', async t => {
+    const executor = new ExecutorExt();
+    executor.start();
+
+    const init0Task: ITask = { targetId: 0, action: 'init' };
+    const init1Task: ITask = { targetId: 1, action: 'init' };
+    const init2Task: ITask = { targetId: 2, action: 'init' };
+    const init3Task: ITask = { targetId: 3, action: 'init' };
+    const init4Task: ITask = { targetId: 4, action: 'init' };
+
+    await Promise.all([
+        executor.executeTask(init0Task),
+        executor.executeTask(init1Task),
+        executor.executeTask(init2Task)
+    ]);
+    await Promise.all([
+        executor.executeTask(init3Task),
+        executor.executeTask(init4Task)
+    ]);
+
+    executor.stop();
+
+    t.equal(executor.getPerformanceReport().min, 2,
+        'executor.performanceReport.min is 2 (' + executor.getPerformanceReport().min + ')');
+    t.equal(executor.getPerformanceReport().max, 3,
+        'executor.performanceReport.max 3 (' + executor.getPerformanceReport().max + ')');
+    t.ok(executor.getPerformanceReport().avg >= 2 && executor.getPerformanceReport().avg <= 3,
+        'executor.performanceReport.avg is between 2 and 3 (' + executor.getPerformanceReport().avg + ')');
+});
+
+ExecutorExt.ts:
+import Executor from '../src/Executor';
+import ITask from '../src/Task';
+import ITaskExt from './ITaskExt';
+import Log from './Log';
+
+export default class ExecutorExt extends Executor {
+    constructor(testname?: string, queue?: { q: ITaskExt[] }) {
+        super();
+
+        if (testname && queue) {
+            this.logger = new Log(testname, queue);
+        }
+    }
+
+    public getPerformanceReport() {
+        return this.performanceReport;
+    }
+
+    public getExecuteData() {
+        return this.executeData;
+    }
+
+    public async executeTask(task: ITask) {
+        if (this.logger) {
+            process.nextTick(this.logger.record.bind(this.logger));
+        }
+        await super.executeTask(task);
+        if (this.logger) {
+            process.nextTick(this.logger.record.bind(this.logger));
+        }
+    }
+
+    public start() {
+        super.start();
+        if (this.logger) {
+            this.logger.start();
+        }
+    }
+
+    public stop() {
+        super.stop();
+        if (this.logger) {
+            this.logger.stop();
+            this.logger.writeHtml();
+        }
+    }
+
+    private logger: Log | undefined;
+}
+
+ITaskExt.ts:import ITask from '../src/Task';
+
+type ITaskExt = ITask & { running?: true, completed?: true, acquired?: true };
+
+export default ITaskExt;
+
+log.ts:import fs from 'fs';
+import path from 'path';
+import tsame from 'tsame';
+import { ActionType } from '../src/Task';
+import ITaskExt from './ITaskExt';
+
+const dirname = path.dirname(__filename);
+interface ILogRecord {
+    date: Date,
+    queue: Array<{
+        targetId: number
+        action: ActionType
+        running?: true
+        completed?: true
+        acquired?: true
+    }>
+}
+
+export default class Log {
+    constructor(name: string, queue: { q: ITaskExt[] }, basepath = dirname) {
+        this.path = path.resolve(basepath, ${name}.log.html);
+        this.name = name;
+        this.queue = queue;
+        this.log = [];
+    }
+
+    public start() {
+        this.interval = setInterval(this.record.bind(this), 100);
+    }
+
+    public stop() {
+        this.record();
+        if (this.interval) {
+            clearInterval(this.interval);
+            delete this.interval;
+        }
+    }
+
+    public record() {
+        this.log.push({
+            date: new Date(),
+            queue: this.queue.q.map(t => ({
+                targetId: t.targetId,
+                action: t.action,
+                running: t.running,
+                completed: t.completed,
+                acquired: t.acquired
+            }))
+        });
+    }
+
+    public writeHtml() {
+        let html = <!DOCTYPE html>
+<html>
+<head>
+    <title>${this.name} log</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        span {
+            font-size: 75%;
+        }
+
+        span + span {
+            margin-left: 0.4em;
+        }
+
+        span.completed {
+            background: greenyellow;
+        }
+
+        span.running {
+            background: orange; 
+        }
+
+        span.acquired {
+            background: lightgoldenrodyellow; 
+        }
+
+        p {
+            margin: 0;
+        }
+
+        p.all span {
+            display: inline-block;
+            width: 1em;
+            height: 1em;
+            border: 1px solid black;
+            box-sizing: border-box;
+            text-align: center;
+            line-height: 1em;
+        }
+    </style>
+</head>
+<body>
+    <table>
+        <caption>${this.name} log</caption>
+        <tr>
+            <th>time</th><th>total</th><th>completed</th><th>acquired</th><th>running</th><th>queued</th><th>map</th>
+        </tr>;
+
+        let prevRecord: ILogRecord | null = null;
+        const start = this.log[0].date.valueOf();
+        for (const record of this.log) {
+            if (!prevRecord || !tsame(record.queue, prevRecord.queue)) {
+                const timeDiff = record.date.valueOf() - (prevRecord ? prevRecord.date.valueOf() : start);
+                prevRecord = record;
+                html += 
+        <tr>
+            <td>${record.date.valueOf() - start}ms (+${timeDiff}ms)</td>
+            <td>${record.queue.length}</td>
+            <td>${record.queue.reduce((count, t) => count + (t.completed ? 1 : 0), 0)}</td>
+            <td>${record.queue.reduce((count, t) => count + (t.acquired && !t.completed && !t.running ? 1 : 0), 0)}</td>
+            <td>${record.queue.reduce((count, t) => count + (t.running ? 1 : 0), 0)}</td>
+            <td>${record.queue.reduce((count, t) => count + (!t.acquired ? 1 : 0), 0)}</td>
+            <td>
+                <p class="all">;
+
+                const targetIds = new Set<number>();
+                for (const t of record.queue) {
+                    targetIds.add(t.targetId);
+                    const classes = [];
+                    if (t.completed) {
+                        classes.push('completed');
+                    }
+                    if (t.acquired && !t.completed && !t.running) {
+                        classes.push('acquired');
+                    }
+                    if (t.running) {
+                        classes.push('running');
+                    }
+                    html += <span 
+                    title="${t.targetId}:${t.action}" 
+                    class="${classes.join(' ')}">${t.targetId}</span>;
+                }
+                html += 
+                </p>;
+            
+                for (const targetId of targetIds) {
+                    html += 
+                <p class="target target-${targetId}"><span>${targetId}:</span>;
+                    for (const t of record.queue) {
+                        if (t.targetId == targetId) {
+                            const classes = [];
+                            if (t.completed) {
+                                classes.push('completed');
+                            }
+                            if (t.acquired && !t.completed && !t.running) {
+                                classes.push('acquired');
+                            }
+                            if (t.running) {
+                                classes.push('running');
+                            }
+                            html += <span class="${classes.join(' ')}">${t.action}</span>;
+                        }
+                    }
+                    html += 
+                </p>;
+                }
+            
+                html += 
+            </td>
+        </tr>;
+            }
+        }
+
+        html += 
+    </table>
+</body>
+</html>;
+        
+        fs.writeFileSync(this.path, html);
+    }
+
+    private path: string;
+    private name: string;
+    private queue: { q: ITaskExt[] };
+    private log: ILogRecord[];
+    private interval?: NodeJS.Timeout;
+}
+run.perf.ts:import t from 'tap';
+import run from '../src/run';
+import { distinctTargetIdsCount, getQueue } from './data';
+import ExecutorExt from './ExecutorExt';
+
+const repeats = 10;
+
+t.test(performance score, async t => {
+    let totalReal = 0;
+    let totalIdeal = 0;
+
+    const limits = [0, 2, 3, 4, 6];
+
+    for (const limit of limits) {
+        const real: number[] = [];
+        const ideal = (limit || distinctTargetIdsCount);
+
+        for (let i = 0; i < repeats; ++i) {
+            const queue = getQueue();
+            const executor = new ExecutorExt();
+            executor.start();
+            await run(executor, queue, limit);
+            executor.stop();
+
+            real.push(executor.getPerformanceReport().avg);
+        }
+
+        const avg = real.reduce((sum, v) => sum + v, 0) / real.length;
+        const sigma = Math.sqrt(real.reduce((dsum, v) => dsum + Math.pow(v - avg, 2), 0) / real.length);
+        const score = (avg / ideal * 100).toFixed(2);
+        t.pass(run() ${limit > 0
+            ? with ${limit} threads
+            : 'without threads limit'
+            } score: ${score} (${avg.toFixed(2)}±${(sigma / avg * 100).toFixed(2)}%));
+        
+        totalReal += avg;
+        totalIdeal += ideal;
+    }
+    t.pass(overall score: ${(totalReal / totalIdeal * 100).toFixed(2)});
+});
+
+readme: # Тестовое задание "Планировщик задач"
+
+* Каждая отдельная задача выглядит следующим образом:
+  
+interface ITask {
+    targetId: number
+    action: 'init' | 'prepare' | 'work' | 'finalize' | 'cleanup'
+  }
+
+
+  Использовать специальные хуки _onComplete или _onExecute нельзя, они используются для диагностики и логирования.
+
+* Есть специальный класс Executor (src/Executor.ts), который умеет исполнять одну задачу:
+  
+Executor.executeTask(task: ITask): Promise<void>
+
+
+  В решении нельзя использовать внутреннее состояние Executor, только IExecutor.executeTask().
+
+Надо реализовать асинхронную функцию, которая получает на вход очередь
+задач AsyncIterable<ITask> и максимальное кол-во одновременных "потоков" maxThreads и возвращает промис, который будет разрезолвлен, когде все задачи
+отработают.
+
+async function run(executor: IExecutor, queue: AsyncIterable<ITask>, maxThreads = 0): Promise<{...}>
+
+При maxThreads == 0 ограничения на кол-во одновременных "потоков" нету.
+
+Функция должна исполнить задачи максимально быстро, стараясь как можно больше задач исполнить параллельно. Но, есть ограничение (в нем заключается основная сложность задачи): в один момент времени Executor не может исполнять несколько разных задач с одним и тем же Task.targetId, но при этом он может исполнять много разных задач с разными Task.targetId параллельно.
+
+* Например, если мы вызовем  
+  
+executor.executeTask({ targetId: 0, action: 'init' });
+  executor.executeTask({ targetId: 0, action: 'prepare' });
+  
+  то, второй вызов кинет исключение.
+
+* При этом  
+  
+executor.executeTask({ targetId: 0, action: 'init' });
+  executor.executeTask({ targetId: 1, action: 'prepare' });
+  
+  или
+  
+await executor.executeTask({ targetId: 0, action: 'init' });
+  await executor.executeTask({ targetId: 0, action: 'prepare' });
+  
+  отработают нормально.
+
+При взятии задачи из очереди (вызов iterator.next() или итерация через for ... of) она автоматически удаляется из очереди, при этом существующие итераторы не инвалидируются. При этом надо учесть, что очередь может быть пополнена во время исполнения задач, а также, никто не гарантирует, что очередь конечна в принципе.
+
+Критерий остановки исполнения функции run(): все полученные из очереди задачи выполнены и в очереди больше нету новых новых задач.
+
+Все задачи для одного и того же ITask.targetId должны быть исполнены последовательно в том порядке, в котором они находятся в очереди.
+
+## Настройка окружения:
+
+* Node.js version >= 12
+
+## Установка и подготовка
+
+npm install
+
+## Разработка решения
+* Заготовка для функции run() лежит в ./src/run.ts. 
+* Никакие другие файлы, кроме ./src/run.ts менять нельзя. 
+* Обвязочный код в run.ts менять нельзя
+* Внутри одного вызова run() создавать дополнительные эксземпляры Executor нельзя.
+
+## Самостоятельная проверка правильности решения
+
+Для удобства я написал тесты для run(), которые проверяют правильность её работы.
+
+npm run test
+
+Также тесты генерят детальные отчеты-логи ./test/*.log.html.
+
+Если при выполнении тестов они зависают в таком состоянии, как ниже на скриншоте, то вероятно вы написали очень неоптимальный алгоритм, который вычитывает слишком много task-ов наперед (больше, чем это необходимо в моменте).
+В системе тестов срабатывает защита от таких решений.
+
+<img width="369" alt="Code_O2bY8fy5hD" src="https://github.com/user-attachments/assets/50278778-01fc-40df-aeda-884de73e7577">
+
+
+У коректного решения npm run test дает следующий вывод:
+
+<img width="440" alt="Code_RLL5YHVeFu" src="https://github.com/user-attachments/assets/76743e2a-5fdb-4d19-8d3e-0a0a8f01c6b8">
