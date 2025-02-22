@@ -1,35 +1,118 @@
 import ITask from "./Task";
+import { IExecutor } from "./Executor";
 
 async function run(
-  executor: { executeTask: (task: ITask) => Promise<void> },
+  executor: IExecutor,
   queue: AsyncIterable<ITask>,
   maxThreads: number = 0
 ): Promise<void> {
-  const executing = new Map<number, boolean>();
-  let taskQueue: Promise<void>[] = []; // Changed from const to let
+  const targetQueues = new Map<
+    number,
+    Array<{ task: ITask; resolve: () => void; reject: (err: any) => void }>
+  >();
+  const executing = new Set<number>();
+  let runningCount = 0;
+  const activePromises: Promise<void>[] = [];
 
-  async function processTask(task: ITask) {
-    const { targetId } = task;
-    while (executing.has(targetId)) {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    executing.set(targetId, true);
+  async function executeTask(task: ITask): Promise<void> {
     try {
       await executor.executeTask(task);
     } catch (error) {
-      console.error(`Error executing task ${JSON.stringify(task)}:`, error);
-    } finally {
-      executing.delete(targetId);
+      throw error;
+    }
+  }
+
+  function processNext(targetId: number): void {
+    const queue = targetQueues.get(targetId);
+    if (!queue || queue.length === 0 || executing.has(targetId)) return;
+    if (maxThreads > 0 && runningCount >= maxThreads) return;
+
+    const { task, resolve, reject } = queue.shift()!;
+    executing.add(targetId);
+    runningCount++;
+
+    const promise = executeTask(task)
+      .then(() => {
+        executing.delete(targetId);
+        runningCount--;
+        resolve();
+        processNext(targetId);
+        processPending();
+      })
+      .catch((err) => {
+        executing.delete(targetId);
+        runningCount--;
+        reject(err);
+        processNext(targetId);
+        processPending();
+      });
+
+    activePromises.push(promise);
+  }
+
+  function processPending(): void {
+    if (maxThreads === 0 || runningCount < maxThreads) {
+      for (const targetId of targetQueues.keys()) {
+        if (!executing.has(targetId) && targetQueues.get(targetId)!.length > 0) {
+          processNext(targetId);
+          if (maxThreads > 0 && runningCount >= maxThreads) break;
+        }
+      }
     }
   }
 
   for await (const task of queue) {
-    taskQueue.push(processTask(task));
-    if (maxThreads > 0 && taskQueue.length >= maxThreads) {
-      await Promise.race(taskQueue);
-      taskQueue = taskQueue.filter((p) => p !== undefined);
+    const { targetId } = task;
+
+    if (!targetQueues.has(targetId)) {
+      targetQueues.set(targetId, []);
+    }
+
+    const queue = targetQueues.get(targetId)!;
+
+    if (executing.has(targetId) || queue.length > 0) {
+      const promise = new Promise<void>((resolve, reject) => {
+        queue.push({ task, resolve, reject });
+      });
+      activePromises.push(promise);
+    } else if (maxThreads === 0 || runningCount < maxThreads) {
+      executing.add(targetId);
+      runningCount++;
+      const promise = executeTask(task)
+        .then(() => {
+          executing.delete(targetId);
+          runningCount--;
+          processNext(targetId);
+          processPending();
+        })
+        .catch((err) => {
+          executing.delete(targetId);
+          runningCount--;
+          processNext(targetId);
+          processPending();
+          throw err;
+        });
+      activePromises.push(promise);
+    } else {
+      const promise = new Promise<void>((resolve, reject) => {
+        queue.push({ task, resolve, reject });
+      });
+      activePromises.push(promise);
+      processPending();
+    }
+
+    if (activePromises.length > 100) {
+      await Promise.race(activePromises);
+      const settled = await Promise.allSettled(activePromises);
+      const newPromises = settled
+        .map((result, i) => (result.status === "pending" ? activePromises[i] : null))
+        .filter((p): p is Promise<void> => p !== null);
+      activePromises.length = 0;
+      activePromises.push(...newPromises);
     }
   }
 
-  await Promise.all(taskQueue);
+  await Promise.all(activePromises);
+  processPending();
+  await Promise.all(activePromises);
 }
