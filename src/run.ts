@@ -103,10 +103,22 @@ async function run(
 
     if (activePromises.length > 100) {
       await Promise.race(activePromises);
-      const settled = await Promise.allSettled(activePromises);
-      const newPromises = settled
-        .map((result, i) => (result.status === "pending" ? activePromises[i] : null))
-        .filter((p): p is Promise<void> => p !== null);
+      const settledPromises = await Promise.all(
+        activePromises.map((p: Promise<void>) =>
+          Promise.race([
+            p,
+            new Promise<void>((_, reject) => setTimeout(() => reject(new Error("timeout")), 10))
+          ])
+          .then(() => true) // Settled successfully
+          .catch(() => false) // Still pending or errored
+        )
+      );
+      const newPromises: Promise<void>[] = [];
+      activePromises.forEach((p: Promise<void>, i: number) => {
+        if (!settledPromises[i]) {
+          newPromises.push(p);
+        }
+      });
       activePromises.length = 0;
       activePromises.push(...newPromises);
     }
@@ -116,3 +128,5 @@ async function run(
   processPending();
   await Promise.all(activePromises);
 }
+
+export default run;

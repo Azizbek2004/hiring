@@ -1,7 +1,7 @@
 import Executor from '../src/Executor';
 import ITask from '../src/Task';
 import ITaskExt from './ITaskExt';
-import Log from './Log';
+import Log from './log';
 
 export default class ExecutorExt extends Executor {
     constructor(testname?: string, queue?: { q: ITaskExt[] }) {
